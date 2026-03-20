@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import API from "../axios";
-
+// import AnalystDashboard from "./AnalystDashboard";
+// import CustomerDashboard from "./CustomerDashboard";
 export default function Login() {
   const navigate = useNavigate();
   const [form, setForm] = useState({ email: "", password: "" });
@@ -17,10 +18,11 @@ export default function Login() {
     try {
       const res = await API.post("/auth/login", form);
       localStorage.setItem("token", res.data.token);
-      localStorage.setItem("role", res.data.role);
+      const role=res.data.user.role;
+      localStorage.setItem("role", role);
 
-      if (res.data.role === "analyst") {
-        navigate("/dashboard");
+      if (role === "analyst") {
+        navigate("/AnalystDashboard");
       } else {
         navigate("/CustomerDashboard");
       }
@@ -29,8 +31,10 @@ export default function Login() {
     } finally {
       setLoading(false);
     }
-  };
 
+
+  };
+  
   return (
     <div style={s.root}>
       <div style={s.leftPanel}>

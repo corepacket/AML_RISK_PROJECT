@@ -13,7 +13,17 @@ export default function Signup() {
     setLoading(true);
     setError("");
     try {
-      await API.post("/auth/signup", form);
+      const res=await API.post("/auth/signup", form);
+
+      localStorage.setItem("token",res.data.token);
+      localStorage.setItem("role",res.data.role);
+
+      if(res.data.role=="analyst"){
+        navigate("/AnalystDashboard");
+      }
+      else{
+        navigate("/CustomerDashboard");
+      }
       alert("Account created successfully!");
       navigate("/CustomerDashboard");
     } catch (err) {
