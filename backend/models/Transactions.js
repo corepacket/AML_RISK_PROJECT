@@ -1,3 +1,6 @@
+// backend/models/Transactions.js
+// Added: riskLevel, explanation, riskFlags, analystAction, analystReviewedAt, analystNote
+
 import mongoose from "mongoose";
 
 const transactionSchema = new mongoose.Schema(
@@ -14,9 +17,10 @@ const transactionSchema = new mongoose.Schema(
     fromAccount: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Account",
+      default: null,
     },
     toAccount: {
-      type: String, // account number string for external receivers
+      type: String,
     },
     amount: {
       type: Number,
@@ -35,6 +39,8 @@ const transactionSchema = new mongoose.Schema(
       enum: ["debit", "credit"],
       default: "debit",
     },
+
+    // ── AI scoring fields ──────────────────────────────────────────────────
     riskScore: {
       type: Number,
       default: 0,
@@ -44,15 +50,47 @@ const transactionSchema = new mongoose.Schema(
       enum: ["Low", "Medium", "High"],
       default: "Low",
     },
+    riskLevel: {
+      type: String,
+      enum: ["Low", "Medium", "High"],
+      default: "Low",
+    },
+    explanation: {
+      type: String,       // AI-generated "why flagged" text
+      default: "",
+    },
+    riskFlags: {
+      type: [String],     // e.g. ["CIRCULAR_FLOW", "RAPID_MOVEMENT"]
+      default: [],
+    },
+
+    // ── Status ────────────────────────────────────────────────────────────
     status: {
       type: String,
       enum: ["Cleared", "Flagged", "Blocked", "Review", "Pending"],
       default: "Cleared",
     },
+
+    // ── Source ────────────────────────────────────────────────────────────
     source: {
       type: String,
       enum: ["manual", "csv", "api"],
       default: "manual",
+    },
+
+    // ── Analyst review ────────────────────────────────────────────────────
+    analystAction: {
+      type: String,
+      enum: ["approved", "blocked", null],
+      default: null,
+    },
+    analystReviewedAt: {
+      type: Date,
+      default: null,
+    },
+    analystNote: {
+      type: String,
+      default: "",
     },
   },
   { timestamps: true }

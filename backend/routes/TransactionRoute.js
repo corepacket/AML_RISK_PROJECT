@@ -1,223 +1,414 @@
+// backend/routes/TransactionRoute.js
+// Endpoints:
+//   POST   /api/transactions/send           — send a transaction (scored by Python AI)
+//   POST   /api/transactions/upload-csv     — batch CSV upload (each row scored by Python AI)
+//   GET    /api/transactions/my             — customer's own transactions
+//   GET    /api/transactions/all            — analyst: all transactions
+//   PATCH  /api/transactions/:id/approve    — analyst: approve a flagged transaction
+//   PATCH  /api/transactions/:id/block      — analyst: block a transaction
+
 import express from "express";
 import multer from "multer";
 import csv from "csv-parser";
 import { Readable } from "stream";
-import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
-import User from "../models/User.js";
+import { v4 as uuidv4 } from "uuid";
+
+import { protect, authorizeRoles } from "../middleware/authMiddleware.js";
+import Transaction from "../models/Transactions.js";
+import { scoreTransaction } from "../services/aiClient.js";
 
 const router = express.Router();
+
+// ── Multer (memory storage — no disk writes) ──────────────────────────────────
 const upload = multer({ storage: multer.memoryStorage() });
 
-const protect = (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ msg: "No token" });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: "Invalid token" }); }
-};
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-const getAml = () => {
-  const db = mongoose.connection.useDb("aml_system");
-  return {
-    transactions: db.collection("transactions"),
-    accounts:     db.collection("accounts"),
+/** Map Python node_status → Mongo Transaction.status enum */
+function mapStatus(nodeStatus) {
+  const map = {
+    BLOCKED:   "Blocked",
+    FLAGGED:   "Flagged",
+    PROCESSED: "Cleared",
   };
-};
+  return map[nodeStatus] || "Cleared";
+}
 
-// ── AML scoring ───────────────────────────────────────────────────────────────
-const runAML = ({ amount, description = "", category = "" }) => {
-  let score = 0;
-  if (amount > 500000)      score += 45;
-  else if (amount > 100000) score += 30;
-  else if (amount > 50000)  score += 20;
-  else if (amount > 10000)  score += 10;
+/** Map risk_level → Transaction.risk enum */
+function mapRisk(riskLevel) {
+  const map = { High: "High", Medium: "Medium", Low: "Low" };
+  return map[riskLevel] || "Low";
+}
 
-  const kw = ["offshore","crypto","shell","anonymous","bearer","ruble","wire"];
-  if (kw.some(w => description.toLowerCase().includes(w))) score += 30;
-  if (category === "Wire Transfer") score += 15;
-  if (category === "Remittance")    score += 15;
-  if (category === "Crypto")        score += 25;
+/**
+ * Normalise a Mongo transaction doc for the frontend.
+ * Analyst + Customer dashboards both use this shape.
+ */
+function normalize(t) {
+  return {
+    transactionId:   t.transactionId,
+    amount:          t.amount,
+    description:     t.description,
+    category:        t.category,
+    type:            t.type,
+    status:          t.status,
+    risk:            t.risk,
+    riskScore:       t.riskScore,
+    riskLevel:       t.riskLevel   || t.risk,
+    reason:          t.explanation || t.reason || "",   // AI explanation
+    explanation:     t.explanation || t.reason || "",
+    riskFlags:       t.riskFlags   || [],
+    source:          t.source,
+    fromAccount:     t.fromAccount,
+    toAccount:       t.toAccount,
+    createdAt:       t.createdAt,
+    updatedAt:       t.updatedAt,
+  };
+}
 
-  let risk, status;
-  if      (score >= 70) { risk = "High";   status = "Blocked"; }
-  else if (score >= 40) { risk = "Medium";  status = "Flagged"; }
-  else                  { risk = "Low";     status = "Cleared"; }
-  return { riskScore: score, risk, status };
-};
-
-// Normalize aml_system txn → frontend shape
-const normalize = (t, customerid) => ({
-  _id:           t._id,
-  transactionId: t.transaction_id,
-  fromAccount:   t.sender_account_id,
-  toAccount:     t.receiver_account_id,
-  amount:        t.amount,
-  currency:      t.currency || "USD",
-  description:   t.description || t.payment_method || "Transaction",
-  category:      t.payment_method || "Transfer",
-  type:          t.sender_customer_id === customerid ? "debit" : "credit",
-  risk:          t.risk_score >= 70 ? "High" : t.risk_score >= 40 ? "Medium" : "Low",
-  riskScore:     t.risk_score || 0,
-  status:        t.status === "PROCESSED" ? "Cleared"
-               : t.status === "BLOCKED"   ? "Blocked"
-               : t.status === "FLAGGED"   ? "Flagged"
-               : t.status || "Cleared",
-  risk_flags:    t.risk_flags || [],
-  createdAt:     t.created_at || t.timestamp || new Date(),
-});
-
-// ── GET /api/transactions/my ──────────────────────────────────────────────────
-router.get("/my", protect, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/transactions/send
+// Customer sends a transaction → Node scores it via Python → saves to Mongo
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/send", protect, authorizeRoles("customer"), async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
-    if (!user?.customer_id) return res.json([]);
+    const {
+      toAccount,
+      amount,
+      description,
+      category,
+      paymentMethod,  // frontend sends camelCase
+    } = req.body;
 
-    const { transactions } = getAml();
-    const txns = await transactions.find({
-      $or: [
-        { sender_customer_id:   user.customer_id },
-        { receiver_customer_id: user.customer_id },
-      ],
-    }).sort({ created_at: -1 }).limit(500).toArray();
-
-    res.json(txns.map(t => normalize(t, user.customer_id)));
-  } catch (err) { res.status(500).json({ msg: err.message }); }
-});
-
-// ── POST /api/transactions/send ───────────────────────────────────────────────
-router.post("/send", protect, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user?.customer_id) return res.status(400).json({ msg: "Profile not linked." });
-
-    const { fromAccount, toAccount, amount, description, category } = req.body;
-    if (!fromAccount || !toAccount || !amount) {
-      return res.status(400).json({ msg: "fromAccount, toAccount, and amount are required." });
+    if (!toAccount || !amount || !description) {
+      return res.status(400).json({
+        status:  "error",
+        message: "toAccount, amount, and description are required.",
+        data:    null,
+      });
     }
 
-    const { transactions, accounts } = getAml();
+    // ── Find sender's account ──────────────────────────────────────────────
+    const amlDb       = mongoose.connection.useDb("aml_system");
+    const accountsCol = amlDb.collection("accounts");
 
-    // Verify sender account
-    const sender = await accounts.findOne({
-      account_id:     fromAccount,
-      customer_id:    user.customer_id,
-      account_status: "ACTIVE",
+    const senderAccount = await accountsCol.findOne({
+      customer_id: req.user.customer_id || req.user.id,
     });
-    if (!sender) return res.status(404).json({ msg: "Sender account not found or frozen." });
 
-    const parsedAmount = parseFloat(amount);
-    if ((sender.balance || 0) < parsedAmount) {
-      return res.status(400).json({ msg: "Insufficient balance." });
+    if (!senderAccount) {
+      return res.status(404).json({
+        status:  "error",
+        message: "Sender account not found.",
+        data:    null,
+      });
     }
 
-    const receiver = await accounts.findOne({ account_id: toAccount });
-    const aml = runAML({ amount: parsedAmount, description, category });
-
-    const txId = `TXN-${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-    const doc = {
-      transaction_id:       txId,
-      timestamp:            new Date(),
-      sender_customer_id:   user.customer_id,
-      sender_account_id:    fromAccount,
-      receiver_customer_id: receiver?.customer_id || null,
-      receiver_account_id:  toAccount,
-      amount:               parsedAmount,
-      currency:             "USD",
-      payment_method:       category || "Transfer",
-      description:          description || "",
-      status:               aml.status === "Blocked" ? "BLOCKED" : aml.status === "Flagged" ? "FLAGGED" : "PROCESSED",
-      risk_score:           aml.riskScore,
-      risk_flags:           aml.status !== "Cleared" ? [aml.risk] : [],
-      created_at:           new Date(),
-    };
-
-    await transactions.insertOne(doc);
-
-    // Update balances (only if not blocked)
-    if (aml.status !== "Blocked") {
-      await accounts.updateOne({ account_id: fromAccount }, { $inc: { balance: -parsedAmount } });
-      if (receiver) await accounts.updateOne({ account_id: toAccount }, { $inc: { balance: parsedAmount } });
+    if (senderAccount.balance < amount) {
+      return res.status(400).json({
+        status:  "error",
+        message: "Insufficient balance.",
+        data:    null,
+      });
     }
 
-    const frontStatus = aml.status === "Blocked" ? "BLOCKED" : aml.status === "Flagged" ? "FLAGGED" : "SUCCESS";
-    res.status(201).json({
-      status:    frontStatus,
-      message:   frontStatus === "SUCCESS" ? "Transaction completed successfully."
-               : frontStatus === "FLAGGED" ? "Transaction flagged for AML review."
-               : "Transaction blocked — high risk detected.",
-      riskScore: aml.riskScore,
-      transactionId: txId,
-      transaction: normalize(doc, user.customer_id),
+    const transactionId = uuidv4();
+    const now           = new Date();
+
+    // ── Call Python AI scoring ─────────────────────────────────────────────
+    const aiResult = await scoreTransaction({
+      transactionId,
+      timestamp:           now.toISOString(),
+      senderCustomerId:    String(senderAccount.customer_id),
+      senderAccountId:     senderAccount.account_id,
+      receiverCustomerId:  "",                // unknown receiver customer
+      receiverAccountId:   toAccount,
+      amount:              Number(amount),
+      currency:            "USD",
+      paymentMethod:       paymentMethod || "UNKNOWN",
+      description:         description   || "",
+      category:            category      || "Transfer",
     });
-  } catch (err) { res.status(500).json({ msg: err.message }); }
+
+    const mongoStatus = mapStatus(aiResult.node_status);
+    const mongoRisk   = mapRisk(aiResult.risk_level);
+
+    // ── Save transaction to Mongo ─────────────────────────────────────────
+    const txn = await Transaction.create({
+      userId:        req.user.id,
+      transactionId,
+      fromAccount:   senderAccount._id,
+      toAccount,
+      amount:        Number(amount),
+      description,
+      category:      category || "Transfer",
+      type:          "debit",
+      status:        mongoStatus,
+      risk:          mongoRisk,
+      riskScore:     aiResult.risk_score,
+      riskLevel:     aiResult.risk_level,
+      explanation:   aiResult.explanation,
+      riskFlags:     aiResult.risk_flags || [],
+      source:        "manual",
+    });
+
+    // ── Deduct balance only if NOT blocked ────────────────────────────────
+    if (mongoStatus !== "Blocked") {
+      await accountsCol.updateOne(
+        { account_id: senderAccount.account_id },
+        { $inc: { balance: -Number(amount) }, $set: { updated_at: now } }
+      );
+    }
+
+    return res.status(201).json({
+      status:  "success",
+      message: `Transaction ${aiResult.node_status}.`,
+      data: {
+        transactionId,
+        frontendStatus: aiResult.node_status,   // SUCCESS | FLAGGED | BLOCKED
+        mongoStatus,
+        riskScore:      aiResult.risk_score,
+        riskLevel:      aiResult.risk_level,
+        explanation:    aiResult.explanation,
+        riskFlags:      aiResult.risk_flags || [],
+        transaction:    normalize(txn),
+      },
+    });
+  } catch (err) {
+    console.error("❌ /send error:", err);
+    res.status(500).json({ status: "error", message: err.message, data: null });
+  }
 });
 
-// ── POST /api/transactions/upload-csv ────────────────────────────────────────
-router.post("/upload-csv", protect, upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ msg: "No file uploaded." });
-    const user = await User.findById(req.user.id);
-    if (!user?.customer_id) return res.status(400).json({ msg: "Profile not linked." });
-
-    const rows = [];
-    const errors = [];
-    await new Promise((resolve, reject) => {
-      Readable.from(req.file.buffer.toString())
-        .pipe(csv())
-        .on("data", r => rows.push(r))
-        .on("end", resolve)
-        .on("error", reject);
-    });
-
-    if (rows.length === 0) return res.status(400).json({ msg: "CSV is empty or invalid." });
-
-    const { transactions } = getAml();
-    let processed = 0, highRisk = 0, flagged = 0, blocked = 0, cleared = 0, cases = 0;
-    const savedTxns = [];
-
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row.toAccount || !row.amount) {
-        errors.push({ row: i+2, msg: "Missing toAccount or amount." }); continue;
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/transactions/upload-csv
+// Analyst uploads a CSV; each row is scored by Python AI
+// CSV columns expected (matching clean_transaction.csv):
+//   Timestamp, Sender_ID, Sender_Account, Receiver_ID,
+//   Receiver_Account, Amount, Currency, Payment_Type
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  "/upload-csv",
+  protect,
+  authorizeRoles("analyst"),
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          status:  "error",
+          message: "No file uploaded.",
+          data:    null,
+        });
       }
-      const amt = parseFloat(row.amount);
-      if (isNaN(amt) || amt <= 0) {
-        errors.push({ row: i+2, msg: `Invalid amount: ${row.amount}` }); continue;
-      }
 
-      const aml = runAML({ amount: amt, description: row.description || "", category: row.category || "Transfer" });
-      const txId = `TXN-CSV-${Date.now()}-${i}`;
-
-      await transactions.insertOne({
-        transaction_id:       txId,
-        timestamp:            new Date(),
-        sender_customer_id:   user.customer_id,
-        sender_account_id:    row.fromAccount || "UNKNOWN",
-        receiver_customer_id: null,
-        receiver_account_id:  row.toAccount,
-        amount:               amt,
-        currency:             "USD",
-        payment_method:       row.category || "Transfer",
-        description:          row.description || "",
-        status:               aml.status === "Blocked" ? "BLOCKED" : aml.status === "Flagged" ? "FLAGGED" : "PROCESSED",
-        risk_score:           aml.riskScore,
-        risk_flags:           aml.status !== "Cleared" ? [aml.risk] : [],
-        source:               "csv",
-        created_at:           new Date(),
+      // ── Parse CSV from buffer ────────────────────────────────────────────
+      const rows = await new Promise((resolve, reject) => {
+        const results = [];
+        const stream  = Readable.from(req.file.buffer);
+        stream
+          .pipe(csv())
+          .on("data", (row) => results.push(row))
+          .on("end",  () => resolve(results))
+          .on("error", reject);
       });
 
-      savedTxns.push({ description: row.description, amount: amt, risk: aml.risk, status: aml.status });
-      processed++;
-      if (aml.risk === "High")      { highRisk++; cases++; }
-      if (aml.status === "Flagged") flagged++;
-      if (aml.status === "Blocked") { blocked++; cases++; }
-      if (aml.status === "Cleared") cleared++;
+      // ── Score each row via Python ─────────────────────────────────────────
+      const scoredRows = [];
+
+      for (const row of rows) {
+        const transactionId = uuidv4();
+        const amount        = parseFloat(row["Amount"] || row["amount"] || 0);
+        const timestamp     = row["Timestamp"] || row["timestamp"] || new Date().toISOString();
+        const paymentMethod = row["Payment_Type"] || row["payment_method"] || "UNKNOWN";
+        const senderAccount = row["Sender_Account"] || row["sender_account"] || "";
+        const receiverAccount = row["Receiver_Account"] || row["receiver_account"] || "";
+        const senderCustomerId  = String(row["Sender_ID"]   || row["sender_id"]   || "");
+        const receiverCustomerId = String(row["Receiver_ID"] || row["receiver_id"] || "");
+
+        // Call Python scoring
+        const aiResult = await scoreTransaction({
+          transactionId,
+          timestamp,
+          senderCustomerId,
+          senderAccountId:  senderAccount,
+          receiverCustomerId,
+          receiverAccountId: receiverAccount,
+          amount,
+          currency:    row["Currency"] || "USD",
+          paymentMethod,
+          description: row["description"] || "CSV import",
+          category:    row["category"]    || "Transfer",
+        });
+
+        const mongoStatus = mapStatus(aiResult.node_status);
+        const mongoRisk   = mapRisk(aiResult.risk_level);
+
+        // Save to Mongo
+        const txn = await Transaction.create({
+          userId:        req.user.id,
+          transactionId,
+          fromAccount:   null,
+          toAccount:     receiverAccount,
+          amount,
+          description:   row["description"] || "CSV import",
+          category:      row["category"]    || "Transfer",
+          type:          "debit",
+          status:        mongoStatus,
+          risk:          mongoRisk,
+          riskScore:     aiResult.risk_score,
+          riskLevel:     aiResult.risk_level,
+          explanation:   aiResult.explanation,
+          riskFlags:     aiResult.risk_flags || [],
+          source:        "csv",
+        });
+
+        scoredRows.push({
+          transactionId,
+          amount,
+          risk:        mongoRisk,
+          status:      mongoStatus,
+          riskScore:   aiResult.risk_score,
+          reason:      aiResult.explanation,
+          explanation: aiResult.explanation,
+          riskFlags:   aiResult.risk_flags || [],
+          senderAccount,
+          receiverAccount,
+        });
+      }
+
+      const flaggedCount = scoredRows.filter((r) => r.status === "Flagged").length;
+      const blockedCount = scoredRows.filter((r) => r.status === "Blocked").length;
+
+      return res.status(200).json({
+        status:  "success",
+        message: `Processed ${scoredRows.length} transactions. Flagged: ${flaggedCount}, Blocked: ${blockedCount}.`,
+        data: {
+          total:    scoredRows.length,
+          flagged:  flaggedCount,
+          blocked:  blockedCount,
+          transactions: scoredRows,
+        },
+      });
+    } catch (err) {
+      console.error("❌ /upload-csv error:", err);
+      res.status(500).json({ status: "error", message: err.message, data: null });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/transactions/my  —  customer's own transactions
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/my", protect, authorizeRoles("customer"), async (req, res) => {
+  try {
+    const txns = await Transaction.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json({
+      status:  "success",
+      message: "Transactions fetched.",
+      data:    txns.map(normalize),
+    });
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message, data: null });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/transactions/all  —  analyst sees all transactions
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/all", protect, authorizeRoles("analyst"), async (req, res) => {
+  try {
+    const txns = await Transaction.find({}).sort({ createdAt: -1 });
+    res.json({
+      status:  "success",
+      message: "All transactions fetched.",
+      data:    txns.map(normalize),
+    });
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message, data: null });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/transactions/:id/approve  —  analyst manually approves
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/:id/approve", protect, authorizeRoles("analyst"), async (req, res) => {
+  try {
+    const txn = await Transaction.findOneAndUpdate(
+      { transactionId: req.params.id },
+      {
+        $set: {
+          status:           "Cleared",
+          analystAction:    "approved",
+          analystReviewedAt: new Date(),
+          analystNote:      req.body.note || "",
+        },
+      },
+      { new: true }
+    );
+
+    if (!txn) {
+      return res.status(404).json({ status: "error", message: "Transaction not found.", data: null });
     }
 
     res.json({
-      report: { total: rows.length, processed, highRisk, flagged, blocked, cleared, cases, transactions: savedTxns, errors: errors.length ? errors : undefined },
+      status:  "success",
+      message: "Transaction approved.",
+      data:    normalize(txn),
     });
-  } catch (err) { res.status(500).json({ msg: err.message }); }
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message, data: null });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/transactions/:id/block  —  analyst manually blocks
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/:id/block", protect, authorizeRoles("analyst"), async (req, res) => {
+  try {
+    const txn = await Transaction.findOneAndUpdate(
+      { transactionId: req.params.id },
+      {
+        $set: {
+          status:            "Blocked",
+          analystAction:     "blocked",
+          analystReviewedAt: new Date(),
+          analystNote:       req.body.note || "",
+        },
+      },
+      { new: true }
+    );
+
+    if (!txn) {
+      return res.status(404).json({ status: "error", message: "Transaction not found.", data: null });
+    }
+
+    res.json({
+      status:  "success",
+      message: "Transaction blocked.",
+      data:    normalize(txn),
+    });
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message, data: null });
+  }
 });
 
 export default router;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
