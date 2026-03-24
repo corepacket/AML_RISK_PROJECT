@@ -12,7 +12,9 @@ const transactionSchema = new mongoose.Schema(
     },
     transactionId: {
       type: String,
+      required:true,
       unique: true,
+      sparse:true
     },
     fromAccount: {
       type: mongoose.Schema.Types.ObjectId,

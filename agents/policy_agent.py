@@ -6,6 +6,7 @@ PATTERN_QUERY_MAP = {
     "HIGH_FREQUENCY_SMALL_VALUE": "FATF structuring smurfing reporting threshold",
     "RAPID_MOVEMENT": "FATF rapid movement layering stage money laundering",
     "UNUSUAL_AMOUNT_SPIKE": "FATF unusual large transaction risk profile",
+    "LARGE_SINGLE_TRANSACTION": "FATF unusually large transaction red flags source of funds",
     "DORMANT_ACCOUNT_ACTIVITY": "FATF dormant account sudden activity suspicious"
 }
 
@@ -15,6 +16,7 @@ RISK_WEIGHTS = {
     "HIGH_FREQUENCY_SMALL_VALUE": 35,
     "RAPID_MOVEMENT": 30,
     "UNUSUAL_AMOUNT_SPIKE": 25,
+    "LARGE_SINGLE_TRANSACTION": 40,
     "DORMANT_ACCOUNT_ACTIVITY": 30
 }
 

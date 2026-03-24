@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional
 
 # ── Internal imports ──────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ class TransactionInput(BaseModel):
 
 
 class ScoreResponse(BaseModel):
-    status: str          # "success" | "error"
+    status: str
     message: str
     data: dict
 
@@ -100,20 +100,25 @@ RISK_TO_STATUS = {
 }
 
 
+# ── Health check ──────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "rag_ready": retriever is not None and not isinstance(retriever, StubRetriever),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
 # ── Main scoring endpoint ─────────────────────────────────────────────────────
 @app.post("/score_transaction", response_model=ScoreResponse)
 async def score_transaction(txn: TransactionInput):
-    """
-    Receives a single transaction from Node, runs the full AML agent pipeline,
-    and returns risk_score, risk_level, verdict, explanation, and status.
-    """
     global retriever
 
     if retriever is None:
         retriever = StubRetriever()
 
     try:
-        # Parse timestamp
         ts = datetime.utcnow()
         if txn.timestamp:
             try:
@@ -121,38 +126,34 @@ async def score_transaction(txn: TransactionInput):
             except Exception:
                 ts = datetime.utcnow()
 
-        # Build initial state for the LangGraph pipeline
         initial_state = {
             "transaction": {
-                "transaction_id":    txn.transaction_id,
-                "timestamp":         ts,
-                "sender_customer_id": txn.sender_customer_id or "",
-                "sender_account_id":  txn.sender_account_id,
+                "transaction_id":       txn.transaction_id,
+                "timestamp":            ts,
+                "sender_customer_id":   txn.sender_customer_id or "",
+                "sender_account_id":    txn.sender_account_id,
                 "receiver_customer_id": txn.receiver_customer_id or "",
                 "receiver_account_id":  txn.receiver_account_id,
-                "amount":            txn.amount,
-                "currency":          txn.currency,
-                "payment_method":    txn.payment_method,
-                "description":       txn.description,
-                "category":          txn.category,
+                "amount":               txn.amount,
+                "currency":             txn.currency,
+                "payment_method":       txn.payment_method,
+                "description":          txn.description,
+                "category":             txn.category,
             },
-            "findings": [],
+            "findings":   [],
             "risk_score": 0,
         }
 
-        # Run the AML graph
-        aml_graph = build_aml_graph(retriever)
+        aml_graph   = build_aml_graph(retriever)
         final_state = aml_graph.invoke(initial_state)
 
-        # Extract results
-        decision = final_state.get("final_decision", {})
+        decision    = final_state.get("final_decision", {})
         risk_score  = decision.get("risk_score", 0)
         risk_level  = decision.get("risk_level", "Low")
         verdict     = decision.get("verdict", "Not Suspicious")
         explanation = decision.get("explanation", "No explanation available.")
 
-        # Derive risk_flags from findings
-        findings = final_state.get("findings", [])
+        findings   = final_state.get("findings", [])
         risk_flags = []
         for f in findings:
             for p in f.get("patterns", []):
@@ -160,10 +161,7 @@ async def score_transaction(txn: TransactionInput):
                 if pat and pat not in risk_flags:
                     risk_flags.append(pat)
 
-        # Map risk_level → Node-facing status
-        node_status = RISK_TO_STATUS.get(risk_level, "PROCESSED")
-
-        # Optional: policy context for debugging
+        node_status    = RISK_TO_STATUS.get(risk_level, "PROCESSED")
         policy_context = final_state.get("policy_context", "")
 
         return {
@@ -176,7 +174,7 @@ async def score_transaction(txn: TransactionInput):
                 "verdict":        verdict,
                 "explanation":    explanation,
                 "risk_flags":     risk_flags,
-                "node_status":    node_status,   # PROCESSED | FLAGGED | BLOCKED
+                "node_status":    node_status,
                 "policy_context": policy_context,
             }
         }
@@ -184,13 +182,3 @@ async def score_transaction(txn: TransactionInput):
     except Exception as e:
         logger.error(f"❌ Scoring error for txn {txn.transaction_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Health check ──────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "rag_ready": not isinstance(retriever, StubRetriever),
-        "timestamp": datetime.utcnow().isoformat(),
-    }

@@ -1,13 +1,41 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import API from "../axios";
+import { useNavigate } from "react-router-dom";
 
 export default function AnalystDashboard() {
+  const navigate = useNavigate();
 
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState(null);
   const [transactions, setTransactions] = useState([]);
   const [filter, setFilter] = useState("ALL");
+
+  const authHeaders = () => ({
+    headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
+  });
+
+  const loadTransactions = async () => {
+    try {
+      const role = localStorage.getItem("role");
+      if (!localStorage.getItem("token")) {
+        navigate("/login");
+        return;
+      }
+      if (role && role !== "analyst") {
+        navigate("/CustomerDashboard");
+        return;
+      }
+      const res = await API.get("/transactions/all", authHeaders());
+      setTransactions(res.data?.data || []);
+    } catch (e) {
+      console.error("Failed to load analyst transactions:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadTransactions();
+  }, []);
 
   const handleUpload = async () => {
     if (!file) return;
@@ -25,12 +53,12 @@ export default function AnalystDashboard() {
         }
       });
 
-      setReport(res.data.report || res.data);
-      setTransactions(res.data.report?.transactions || []);
+      setReport(res.data.data || res.data.report || res.data);
+      await loadTransactions();
 
     } catch (e) {
       console.error(e);
-      alert("Upload failed");
+      alert(e.response?.data?.message || "Upload failed");
     } finally {
       setLoading(false);
     }

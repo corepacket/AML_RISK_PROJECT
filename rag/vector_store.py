@@ -1,4 +1,6 @@
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
+
+
 
 def create_vector_store(documents,embedding_model,persist_directory):
     vectorstore=Chroma.from_documents(

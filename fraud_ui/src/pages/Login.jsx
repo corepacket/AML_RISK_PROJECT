@@ -27,7 +27,7 @@ export default function Login() {
         navigate("/CustomerDashboard");
       }
     } catch (err) {
-      setError(err.response?.data?.msg || "Invalid credentials");
+      setError(err.response?.data?.message || err.response?.data?.msg || "Invalid credentials");
     } finally {
       setLoading(false);
     }

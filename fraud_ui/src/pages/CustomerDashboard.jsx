@@ -83,6 +83,7 @@ export default function CustomerDashboard() {
       if (profRes.status === "fulfilled") {
         const data = profRes.value.data;
         if (data.setupRequired) { navigate("/profile-setup"); return; }
+        if (data.user?.role && data.user.role !== "customer") { navigate("/AnalystDashboard"); return; }
         setUser(data.user);
       } else {
         const status = profRes.reason?.response?.status;
@@ -98,7 +99,11 @@ export default function CustomerDashboard() {
       // Transactions — from aml_system.transactions (normalized by backend)
       // Schema: { transactionId, fromAccount, toAccount, amount, currency,
       //           description, category, type, risk, riskScore, status, createdAt }
-      setTxns(txnsRes.status === "fulfilled" ? (txnsRes.value.data || []) : []);
+      setTxns(
+        txnsRes.status === "fulfilled"
+          ? (txnsRes.value.data?.data || txnsRes.value.data || [])
+          : []
+      );
 
     } catch (e) {
       setErr("Something went wrong. Please retry.");
@@ -128,8 +133,13 @@ export default function CustomerDashboard() {
     e.preventDefault(); setSendLoading(true); setSendResult(null);
     try {
       const res = await API.post("/transactions/send", sendForm, auth());
-      setSendResult(res.data);
-      if (res.data.transaction) setTxns(p => [res.data.transaction, ...p]);
+      const payload = res.data?.data || {};
+      setSendResult({
+        status: payload.frontendStatus || payload.mongoStatus || "SUCCESS",
+        message: res.data?.message || "Transaction processed.",
+        riskScore: payload.riskScore,
+      });
+      if (payload.transaction) setTxns(p => [payload.transaction, ...p]);
       // Refresh accounts to show updated balance
       const aRes = await API.get("/accounts/my", auth());
       setAccounts(aRes.data || []);
@@ -148,11 +158,11 @@ export default function CustomerDashboard() {
       const res = await API.post("/transactions/upload-csv", fd, {
         headers: { Authorization:`Bearer ${localStorage.getItem("token")}`, "Content-Type":"multipart/form-data" },
       });
-      setCsvReport(res.data.report || res.data);
+      setCsvReport(res.data.data || res.data.report || res.data);
       const tRes = await API.get("/transactions/my", auth());
-      setTxns(tRes.data || []);
+      setTxns(tRes.data?.data || tRes.data || []);
     } catch (e) {
-      setCsvReport({ error: e.response?.data?.msg || "Upload failed." });
+      setCsvReport({ error: e.response?.data?.message || e.response?.data?.msg || "Upload failed." });
     } finally {
       setCsvLoading(false); setCsvFile(null);
       if (fileRef.current) fileRef.current.value = "";

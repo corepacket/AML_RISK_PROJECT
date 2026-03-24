@@ -13,21 +13,11 @@ export default function Signup() {
     setLoading(true);
     setError("");
     try {
-      const res=await API.post("/auth/signup", form);
-
-      localStorage.setItem("token",res.data.token);
-      localStorage.setItem("role",res.data.role);
-
-      if(res.data.role=="analyst"){
-        navigate("/AnalystDashboard");
-      }
-      else{
-        navigate("/CustomerDashboard");
-      }
-      alert("Account created successfully!");
-      navigate("/CustomerDashboard");
+      await API.post("/auth/signup", form);
+      alert("Account created successfully! Please log in.");
+      navigate("/login");
     } catch (err) {
-      setError(err.response?.data?.msg || "Signup failed. Please try again.");
+      setError(err.response?.data?.message || err.response?.data?.msg || "Signup failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -146,7 +136,7 @@ export default function Signup() {
 
           <p style={s.loginText}>
             Already have an account?{" "}
-            <Link to="/" style={s.loginLink}>Sign In</Link>
+            <Link to="/login" style={s.loginLink}>Sign In</Link>
           </p>
         </div>
       </div>

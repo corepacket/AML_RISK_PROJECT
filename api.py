@@ -1,11 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import pandas as pd
 from typing import List, Any, Dict
 from datetime import datetime
 import uuid
+from pydantic import BaseModel
+from typing import Optional
 
 from database.mongodb import transactions_col
 from agents.transaction_agent import transaction_agent
@@ -47,6 +50,33 @@ def run_aml_pipeline(txn):
 
 
 app = FastAPI(title="AML Risk Scoring API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class TransactionInput(BaseModel):
+    transaction_id: str
+    timestamp: Optional[str] = None
+    sender_customer_id: Optional[str] = None
+    sender_account_id: str
+    receiver_customer_id: Optional[str] = None
+    receiver_account_id: str
+    amount: float
+    currency: Optional[str] = "USD"
+    payment_method: Optional[str] = "UNKNOWN"
+    description: Optional[str] = ""
+    category: Optional[str] = "Transfer"
+
+
+RISK_TO_STATUS = {
+    "High": "BLOCKED",
+    "Medium": "FLAGGED",
+    "Low": "PROCESSED",
+}
 
 
 def _save_upload_to_disk(upload: UploadFile, folder: str = "uploads") -> str:
@@ -107,6 +137,82 @@ def _load_transactions_from_csv(path: str) -> List[Dict[str, Any]]:
     return txns
 
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "rag_ready": not isinstance(retriever, StubRetriever),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/score_transaction")
+async def score_transaction(txn: TransactionInput):
+    """
+    Score one transaction and return a backend-compatible response.
+    """
+    try:
+        ts = datetime.utcnow()
+        if txn.timestamp:
+            try:
+                ts = datetime.fromisoformat(txn.timestamp.replace("Z", "+00:00"))
+            except Exception:
+                ts = datetime.utcnow()
+
+        transaction = {
+            "transaction_id": txn.transaction_id,
+            "timestamp": ts,
+            "sender_customer_id": txn.sender_customer_id or "",
+            "sender_account_id": txn.sender_account_id,
+            "receiver_customer_id": txn.receiver_customer_id or "",
+            "receiver_account_id": txn.receiver_account_id,
+            "amount": txn.amount,
+            "currency": txn.currency,
+            "payment_method": txn.payment_method,
+            "description": txn.description,
+            "category": txn.category,
+            "status": "PROCESSING",
+            "risk_score": 0,
+            "risk_flags": [],
+            "created_at": datetime.utcnow(),
+        }
+
+        final_state = run_aml_pipeline(transaction)
+        decision = final_state.get("final_decision", {})
+        findings = final_state.get("findings", [])
+
+        risk_flags = []
+        for finding in findings:
+            for pattern in finding.get("patterns", []):
+                pat = pattern.get("pattern")
+                if pat and pat not in risk_flags:
+                    risk_flags.append(pat)
+
+        risk_score = decision.get("risk_score", final_state.get("risk_score", 0))
+        risk_level = decision.get("risk_level", "Low")
+        verdict = decision.get("verdict", "Not Suspicious")
+        explanation = decision.get("explanation", "")
+        node_status = RISK_TO_STATUS.get(risk_level, "PROCESSED")
+        policy_context = final_state.get("policy_context", "")
+
+        return {
+            "status": "success",
+            "message": "Transaction scored successfully.",
+            "data": {
+                "transaction_id": txn.transaction_id,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "verdict": verdict,
+                "explanation": explanation,
+                "risk_flags": risk_flags,
+                "node_status": node_status,
+                "policy_context": policy_context,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scoring failed: {str(e)}")
+
+
 @app.post("/upload_transactions")
 async def upload_transactions(file: UploadFile = File(...)):
     """
@@ -124,6 +230,9 @@ async def upload_transactions(file: UploadFile = File(...)):
         for txn in txns:
             # Store in Mongo (Atlas) first with PROCESSING status
             txn["status"] = "PROCESSING"
+            # Important: Node backend schemas often use `transactionId` (camelCase) with a unique index.
+            # Ensure both keys are present to avoid duplicate key errors on { transactionId: null }.
+            txn["transactionId"] = txn.get("transaction_id")
             transactions_col.insert_one(txn)
 
             # Run AML pipeline (same as main.py)
@@ -131,7 +240,7 @@ async def upload_transactions(file: UploadFile = File(...)):
             
             # Update transaction status to PROCESSED after analysis
             transactions_col.update_one(
-                {"transaction_id": txn["transaction_id"]},
+                {"transactionId": txn["transaction_id"]},
                 {"$set": {"status": "PROCESSED", "risk_score": final_state.get("risk_score", 0)}}
             )
 
